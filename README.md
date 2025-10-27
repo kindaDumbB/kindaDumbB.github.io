@@ -16,6 +16,7 @@
 <br>the minecrafts serveres discord is <a href="https://discord.gg/5dCxFntgCv">https://discord.gg/5dCxFntgCv</a>
 <br>my contact info is 2p1p.2.8@gmail.com and ilikecats404 on discord
 <br>below is some legal crap i dont understand :D
+<br>https://github.com/kindaDumbB/encrypted81314561233
 
 <br>Privacy policy
 <br>1. Information Collection and Use
