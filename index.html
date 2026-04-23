@@ -1,163 +1,159 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8" />
-<title>Stable RNNoise Mic</title>
-</head>
+<canvas id="sound"></canvas>
+<button id="toggle">Toggle Mic</button>
 
-<body style="background:#111;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column">
+<script type="module">
+import rnnoise from './rnnoise.js';
 
-<button id="start">Start Mic</button>
-<div id="status">Idle</div>
+const $ = document.querySelector.bind(document);
 
-<script>
-let ctx;
-let wasm;
-let memory;
-let state;
-let denoise;
-let ready = false;
-
-const FRAME_SIZE = 480;
-
-// -----------------------------
-// Load WASM safely
-// -----------------------------
-async function loadWasm() {
-  const res = await fetch("rnnoise.wasm");
-
-  if (!res.ok) throw new Error("WASM not found");
-
-  const bytes = await res.arrayBuffer();
-
-  const importObject = {
-    env: {
-      memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
-      emscripten_resize_heap: () => {}
-    }
-  };
-
-  const { instance } = await WebAssembly.instantiate(bytes, importObject);
-
-  wasm = instance;
-  memory = importObject.env.memory;
-
-  // Try multiple export names (RNNoise builds differ)
-  denoise =
-    wasm.exports.rnnoise_process_frame ||
-    wasm.exports.process_frame ||
-    wasm.exports.rnnoise_process ||
-    wasm.exports._rnnoise_process_frame;
-
-  const create =
-    wasm.exports.rnnoise_create ||
-    wasm.exports.create ||
-    wasm.exports._rnnoise_create;
-
-  if (!denoise) {
-    console.warn("No RNNoise function found, using passthrough");
-    ready = false;
-    return;
-  }
-
-  if (create) {
-    state = create();
-  }
-
-  ready = true;
-  console.log("RNNoise ready");
+function getAudioStream() {
+  return navigator.mediaDevices.getUserMedia({ audio: true });
 }
 
-// -----------------------------
-// Frame-safe processing
-// -----------------------------
-function processFrame(input) {
-  if (!ready || !denoise) {
-    return input; // SAFE fallback (prevents silence/noise spikes)
-  }
-
-  const ptr = wasm.exports.malloc(FRAME_SIZE * 4);
-  const buffer = new Float32Array(memory.buffer, ptr, FRAME_SIZE);
-
-  for (let i = 0; i < FRAME_SIZE; i++) {
-    buffer[i] = input[i] || 0;
-  }
-
-  // Safe call (different builds supported)
-  try {
-    if (state !== undefined) {
-      denoise(state, ptr, ptr);
-    } else {
-      denoise(ptr, ptr);
-    }
-  } catch (e) {
-    console.warn("RNNoise error, fallback active", e);
-    wasm.exports.free(ptr);
-    return input;
-  }
-
-  const output = new Float32Array(FRAME_SIZE);
-  output.set(buffer);
-
-  wasm.exports.free(ptr);
-
-  return output;
+function setupCanvas(elem) {
+  const ctx = elem.getContext("2d");
+  elem.width = 400;
+  elem.height = 200;
+  elem.style.border = "4px solid black";
+  return ctx;
 }
 
-// -----------------------------
-// Start audio
-// -----------------------------
-document.getElementById("start").onclick = async () => {
-  const status = document.getElementById("status");
+const canvas = $("#sound");
+const ctx = setupCanvas(canvas);
 
-  status.textContent = "Loading WASM...";
+let audioCtx;
+let processor;
+let source;
+let analyser;
+let gainNode;
 
-  await loadWasm();
+let running = false;
 
-  ctx = new AudioContext({ sampleRate: 48000 });
+async function start() {
+  audioCtx = new AudioContext();
 
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: false
-    }
-  });
+  const stream = await getAudioStream();
 
-  const source = ctx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  source = audioCtx.createMediaStreamSource(stream);
 
-  const processor = ctx.createScriptProcessor(1024, 1, 1);
+  processor = audioCtx.createScriptProcessor(1024, 1, 1);
+  gainNode = audioCtx.createGain();
 
-  let buffer = [];
+  const {
+    _rnnoise_create,
+    _rnnoise_process_frame,
+    _rnnoise_destroy,
+    _malloc,
+    _free,
+    HEAPF32
+  } = await rnnoise();
+
+  const FRAME = 480;
+
+  const inPtr = _malloc(FRAME * 4);
+  const outPtr = _malloc(FRAME * 4);
+
+  const inIndex = inPtr / 4;
+  const outIndex = outPtr / 4;
+
+  const rn = _rnnoise_create();
+
+  let buffer = new Float32Array(0);
+
+  function process(frame) {
+    HEAPF32.set(frame, inIndex);
+    _rnnoise_process_frame(rn, outPtr, inPtr);
+    return new Float32Array(HEAPF32.slice(outIndex, outIndex + FRAME));
+  }
 
   processor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
     const output = e.outputBuffer.getChannelData(0);
 
-    for (let i = 0; i < input.length; i++) {
-      buffer.push(input[i]);
+    if (!running) {
+      output.fill(0);
+      return;
+    }
 
-      if (buffer.length === FRAME_SIZE) {
-        const clean = processFrame(buffer);
-        buffer = [];
+    const merged = new Float32Array(buffer.length + input.length);
+    merged.set(buffer);
+    merged.set(input, buffer.length);
+    buffer = merged;
 
-        for (let j = 0; j < FRAME_SIZE; j++) {
-          output[j] = clean[j] || 0;
-        }
-      } else {
-        output[i] = input[i]; // ALWAYS pass-through
-      }
+    let i = 0;
+
+    while (buffer.length >= FRAME && i + FRAME <= output.length) {
+      const frame = buffer.slice(0, FRAME);
+      buffer = buffer.slice(FRAME);
+
+      const cleaned = process(frame);
+      output.set(cleaned, i);
+
+      i += FRAME;
+    }
+
+    // fill rest silence
+    for (; i < output.length; i++) {
+      output[i] = 0;
     }
   };
 
-  source.connect(processor);
-  processor.connect(ctx.destination);
+  // 🔥 REAL AUDIO ROUTE
+  source.connect(analyser);
+  analyser.connect(processor);
 
-  status.textContent = ready
-    ? "RNNoise ACTIVE"
-    : "Fallback mode (no RNNoise export found)";
+  // IMPORTANT: use gain as final gate
+  processor.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+
+  gainNode.gain.value = 1;
+
+  draw();
+}
+
+function stop() {
+  running = false;
+
+  if (gainNode) gainNode.gain.value = 0;
+
+  if (audioCtx) {
+    audioCtx.close();
+  }
+}
+
+function draw() {
+  if (!analyser) return;
+
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(data);
+
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, 400, 200);
+
+  ctx.beginPath();
+  ctx.strokeStyle = "#000";
+
+  const step = 400 / data.length;
+  ctx.moveTo(0, 200);
+
+  for (let i = 0; i < data.length; i++) {
+    const y = 200 - (data[i] / 255) * 180;
+    ctx.lineTo(i * step, y);
+  }
+
+  ctx.stroke();
+
+  requestAnimationFrame(draw);
+}
+
+$("#toggle").onclick = async () => {
+  running = !running;
+
+  if (running) {
+    await start();
+  } else {
+    stop();
+  }
 };
 </script>
-
-</body>
-</html>
