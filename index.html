@@ -1,128 +1,142 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>RNNoise WASM Mic</title>
-</head>
+<canvas id="sound"></canvas>
 
-<body style="background:#111;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column">
+<script type="module">
+import rnnoise from './rnnoise.js';
 
-<button id="start">Start RNNoise</button>
-<div id="status">Idle</div>
+const $ = document.querySelector.bind(document);
 
-<script>
-let audioCtx;
-let wasm;
-let memory;
-let denoiseFunc;
-let statePtr;
-
-const FRAME_SIZE = 480; // RNNoise requirement (10ms @ 48kHz)
-
-async function loadWasm() {
-  const response = await fetch("rnnoise.wasm");
-  const bytes = await response.arrayBuffer();
-
-  const importObject = {
-    env: {
-      memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
-      emscripten_resize_heap: () => {}
-    }
-  };
-
-  const result = await WebAssembly.instantiate(bytes, importObject);
-
-  wasm = result.instance;
-  memory = importObject.env.memory;
-
-  // Try common exported symbols (depends on build)
-  denoiseFunc = wasm.exports.rnnoise_process_frame || wasm.exports.process || wasm.exports.denoise;
-
-  if (!denoiseFunc) {
-    throw new Error("Could not find RNNoise export function. Check WASM build.");
-  }
-
-  // state init (varies by build)
-  if (wasm.exports.rnnoise_create) {
-    statePtr = wasm.exports.rnnoise_create();
-  }
-
-  console.log("WASM loaded");
+function getAudioStream() {
+  return navigator.mediaDevices.getUserMedia({ audio: true });
 }
 
-function processFrame(input) {
-  // Allocate buffer in WASM memory
-  const ptr = wasm.exports.malloc(FRAME_SIZE * 4);
+async function analyse(stream, hasDetector = false) {
+  const context = new AudioContext();
 
-  const floatView = new Float32Array(memory.buffer, ptr, FRAME_SIZE);
+  const analyser = context.createAnalyser();
+  const source = context.createMediaStreamSource(stream);
 
-  for (let i = 0; i < FRAME_SIZE; i++) {
-    floatView[i] = input[i] || 0;
-  }
+  // IMPORTANT: must allow output channel
+  const processor = context.createScriptProcessor(1024, 1, 1);
 
-  // RNNoise call (depends on build signature)
-  if (statePtr) {
-    denoiseFunc(statePtr, ptr, ptr);
-  } else {
-    denoiseFunc(ptr, ptr);
-  }
+  let drawFn;
 
-  const output = new Float32Array(FRAME_SIZE);
-  output.set(floatView);
+  if (hasDetector) {
+    const {
+      _rnnoise_create: createNoise,
+      _rnnoise_process_frame: processNoise,
+      _rnnoise_destroy: destroyNoise,
+      _malloc: malloc,
+      _free: free,
+      HEAPF32
+    } = await rnnoise();
 
-  wasm.exports.free(ptr);
+    const SAMPLE_LENGTH = 480;
+    const BUFFER_SIZE = SAMPLE_LENGTH * 4;
 
-  return output;
-}
+    const inPtr = malloc(BUFFER_SIZE);
+    const outPtr = malloc(BUFFER_SIZE);
 
-document.getElementById("start").onclick = async () => {
-  const status = document.getElementById("status");
+    const inIndex = inPtr / 4;
+    const outIndex = outPtr / 4;
 
-  status.textContent = "Loading WASM...";
-  await loadWasm();
+    const rn = createNoise();
 
-  audioCtx = new AudioContext({ sampleRate: 48000 });
+    const processFrame = (frame) => {
+      // RNNoise expects float32 [-1, 1]
+      HEAPF32.set(frame, inIndex);
+      processNoise(rn, outPtr, inPtr);
 
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: false
-    }
-  });
+      return HEAPF32.slice(outIndex, outIndex + SAMPLE_LENGTH);
+    };
 
-  const source = audioCtx.createMediaStreamSource(stream);
+    let residue = new Float32Array([]);
 
-  const processor = audioCtx.createScriptProcessor(1024, 1, 1);
+    processor.onaudioprocess = (e) => {
+      const input = e.inputBuffer.getChannelData(0);
+      const output = e.outputBuffer.getChannelData(0);
 
-  let buffer = [];
+      const combined = new Float32Array(residue.length + input.length);
+      combined.set(residue);
+      combined.set(input, residue.length);
 
-  processor.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-    const output = e.outputBuffer.getChannelData(0);
+      let i = 0;
+      let outOffset = 0;
 
-    for (let i = 0; i < input.length; i++) {
-      buffer.push(input[i]);
+      while (i + SAMPLE_LENGTH <= combined.length && outOffset + SAMPLE_LENGTH <= output.length) {
+        const frame = combined.slice(i, i + SAMPLE_LENGTH);
+        const cleaned = processFrame(frame);
 
-      if (buffer.length === FRAME_SIZE) {
-        const clean = processFrame(buffer);
-        buffer = [];
+        output.set(cleaned, outOffset);
 
-        for (let j = 0; j < FRAME_SIZE; j++) {
-          output[j] = clean[j] || 0;
-        }
-      } else {
-        output[i] = input[i];
+        i += SAMPLE_LENGTH;
+        outOffset += SAMPLE_LENGTH;
       }
+
+      residue = combined.slice(i);
+    };
+
+    window.addEventListener("beforeunload", () => {
+      free(inPtr);
+      free(outPtr);
+      destroyNoise(rn);
+    });
+
+    source.connect(analyser);
+    analyser.connect(processor);
+    processor.connect(context.destination); // 🔥 THIS enables loopback
+
+  } else {
+    source.connect(analyser);
+    analyser.connect(context.destination);
+  }
+
+  const bufferLen = analyser.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLen);
+
+  drawFn = (ctx) => {
+    analyser.getByteFrequencyData(dataArray);
+
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, 400, 200);
+
+    ctx.beginPath();
+    ctx.strokeStyle = "#000";
+
+    const slice = 400 / bufferLen;
+    ctx.moveTo(0, 200);
+
+    for (let i = 0; i < bufferLen; i++) {
+      const y = 200 - (dataArray[i] / 255) * 180;
+      ctx.lineTo(i * slice, y);
     }
+
+    ctx.lineTo(400, 200);
+    ctx.stroke();
   };
 
-  source.connect(processor);
-  processor.connect(audioCtx.destination);
+  return drawFn;
+}
 
-  status.textContent = "RNNoise active (WASM running)";
-};
+function setupCanvas(elem) {
+  const ctx = elem.getContext("2d");
+  elem.width = 400;
+  elem.height = 200;
+  elem.style.border = "4px solid black";
+  return ctx;
+}
+
+const canvas = $("#sound");
+const ctx = setupCanvas(canvas);
+
+(async () => {
+  const stream = await getAudioStream();
+  const draw = await analyse(stream, true);
+
+  function loop() {
+    draw(ctx);
+    requestAnimationFrame(loop);
+  }
+
+  loop();
+})();
 </script>
-
-</body>
-</html>
