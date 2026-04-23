@@ -9,146 +9,81 @@ function getAudioStream() {
   return navigator.mediaDevices.getUserMedia({ audio: true });
 }
 
-async function analyse(stream, hasDetector = false) {
-  const context = new AudioContext();
+async function analyse(stream) {
+  const ctx = new AudioContext();
 
-  const analyser = context.createAnalyser();
-  const source = context.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  const source = ctx.createMediaStreamSource(stream);
+  const processor = ctx.createScriptProcessor(1024, 1, 1);
 
-  const processor = context.createScriptProcessor(1024, 1, 1);
+  const {
+    _rnnoise_create,
+    _rnnoise_process_frame,
+    _rnnoise_destroy,
+    _malloc,
+    _free,
+    HEAPF32
+  } = await rnnoise();
 
-  let drawFn;
+  const FRAME = 480;
 
-  if (hasDetector) {
-    const {
-      _rnnoise_create,
-      _rnnoise_process_frame,
-      _rnnoise_destroy,
-      _malloc,
-      _free,
-      HEAPF32
-    } = await rnnoise();
+  const inPtr = _malloc(FRAME * 4);
+  const outPtr = _malloc(FRAME * 4);
 
-    const SAMPLE = 480;
+  const inIndex = inPtr / 4;
+  const outIndex = outPtr / 4;
 
-    const inPtr = _malloc(SAMPLE * 4);
-    const outPtr = _malloc(SAMPLE * 4);
+  const rn = _rnnoise_create();
 
-    const inIndex = inPtr / 4;
-    const outIndex = outPtr / 4;
+  // 🔥 CRITICAL: strict frame buffer (NO streaming mix)
+  let buffer = new Float32Array(0);
 
-    const rn = _rnnoise_create();
-
-    // 🔥 proper streaming buffer
-    let queue = new Float32Array(0);
-
-    function push(a) {
-      const merged = new Float32Array(queue.length + a.length);
-      merged.set(queue);
-      merged.set(a, queue.length);
-      queue = merged;
-    }
-
-    function pop(n) {
-      const out = queue.slice(0, n);
-      queue = queue.slice(n);
-      return out;
-    }
-
-    function processFrame(frame) {
-      HEAPF32.set(frame, inIndex);
-      _rnnoise_process_frame(rn, outPtr, inPtr);
-      return HEAPF32.slice(outIndex, outIndex + SAMPLE);
-    }
-
-    processor.onaudioprocess = (e) => {
-      const input = e.inputBuffer.getChannelData(0);
-      const output = e.outputBuffer.getChannelData(0);
-
-      push(input);
-
-      let offset = 0;
-
-      // 🔥 ALWAYS fill output fully
-      while (offset < output.length) {
-
-        if (queue.length >= SAMPLE) {
-          const frame = pop(SAMPLE);
-          const cleaned = processFrame(frame);
-
-          output.set(cleaned, offset);
-          offset += SAMPLE;
-
-        } else {
-          // 🔥 no underrun silence = avoid crackle
-          const remaining = output.length - offset;
-          output.set(queue.slice(0, remaining), offset);
-          queue = queue.slice(remaining);
-          offset += remaining;
-        }
-      }
-    };
-
-    window.addEventListener("beforeunload", () => {
-      _free(inPtr);
-      _free(outPtr);
-      _rnnoise_destroy(rn);
-    });
-
-    source.connect(analyser);
-    analyser.connect(processor);
-    processor.connect(context.destination);
-
-  } else {
-    source.connect(analyser);
-    analyser.connect(context.destination);
+  function process(frame) {
+    HEAPF32.set(frame, inIndex);
+    _rnnoise_process_frame(rn, outPtr, inPtr);
+    return new Float32Array(HEAPF32.slice(outIndex, outIndex + FRAME));
   }
 
-  const bufferLen = analyser.frequencyBinCount;
-  const dataArray = new Uint8Array(bufferLen);
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const output = e.outputBuffer.getChannelData(0);
 
-  drawFn = (ctx) => {
-    analyser.getByteFrequencyData(dataArray);
+    // accumulate
+    const merged = new Float32Array(buffer.length + input.length);
+    merged.set(buffer);
+    merged.set(input, buffer.length);
+    buffer = merged;
 
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0, 0, 400, 200);
+    let outOffset = 0;
 
-    ctx.beginPath();
-    ctx.strokeStyle = "#000";
+    // 🔥 ONLY full frames
+    while (buffer.length >= FRAME && outOffset + FRAME <= output.length) {
+      const frame = buffer.slice(0, FRAME);
+      buffer = buffer.slice(FRAME);
 
-    const step = 400 / bufferLen;
-    ctx.moveTo(0, 200);
+      const cleaned = process(frame);
+      output.set(cleaned, outOffset);
 
-    for (let i = 0; i < bufferLen; i++) {
-      const y = 200 - (dataArray[i] / 255) * 180;
-      ctx.lineTo(i * step, y);
+      outOffset += FRAME;
     }
 
-    ctx.stroke();
+    // 🔥 fill remainder to avoid crackle/silence gaps
+    for (; outOffset < output.length; outOffset++) {
+      output[outOffset] = 0;
+    }
   };
 
-  return drawFn;
-}
+  source.connect(analyser);
+  analyser.connect(processor);
+  processor.connect(ctx.destination); // loopback
 
-function setupCanvas(elem) {
-  const ctx = elem.getContext("2d");
-  elem.width = 400;
-  elem.height = 200;
-  elem.style.border = "4px solid black";
-  return ctx;
+  return (ctx2) => {
+    analyser.getByteFrequencyData(new Uint8Array(analyser.frequencyBinCount));
+  };
 }
-
-const ctx = setupCanvas($("#sound"));
 
 (async () => {
   const stream = await getAudioStream();
-  const draw = await analyse(stream, true);
-
-  function loop() {
-    draw(ctx);
-    requestAnimationFrame(loop);
-  }
-
-  loop();
+  await analyse(stream);
 })();
 </script>
