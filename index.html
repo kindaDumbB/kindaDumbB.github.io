@@ -15,75 +15,89 @@ async function analyse(stream, hasDetector = false) {
   const analyser = context.createAnalyser();
   const source = context.createMediaStreamSource(stream);
 
-  // IMPORTANT: must allow output channel
   const processor = context.createScriptProcessor(1024, 1, 1);
 
   let drawFn;
 
   if (hasDetector) {
     const {
-      _rnnoise_create: createNoise,
-      _rnnoise_process_frame: processNoise,
-      _rnnoise_destroy: destroyNoise,
-      _malloc: malloc,
-      _free: free,
+      _rnnoise_create,
+      _rnnoise_process_frame,
+      _rnnoise_destroy,
+      _malloc,
+      _free,
       HEAPF32
     } = await rnnoise();
 
-    const SAMPLE_LENGTH = 480;
-    const BUFFER_SIZE = SAMPLE_LENGTH * 4;
+    const SAMPLE = 480;
 
-    const inPtr = malloc(BUFFER_SIZE);
-    const outPtr = malloc(BUFFER_SIZE);
+    const inPtr = _malloc(SAMPLE * 4);
+    const outPtr = _malloc(SAMPLE * 4);
 
     const inIndex = inPtr / 4;
     const outIndex = outPtr / 4;
 
-    const rn = createNoise();
+    const rn = _rnnoise_create();
 
-    const processFrame = (frame) => {
-      // RNNoise expects float32 [-1, 1]
+    // 🔥 proper streaming buffer
+    let queue = new Float32Array(0);
+
+    function push(a) {
+      const merged = new Float32Array(queue.length + a.length);
+      merged.set(queue);
+      merged.set(a, queue.length);
+      queue = merged;
+    }
+
+    function pop(n) {
+      const out = queue.slice(0, n);
+      queue = queue.slice(n);
+      return out;
+    }
+
+    function processFrame(frame) {
       HEAPF32.set(frame, inIndex);
-      processNoise(rn, outPtr, inPtr);
-
-      return HEAPF32.slice(outIndex, outIndex + SAMPLE_LENGTH);
-    };
-
-    let residue = new Float32Array([]);
+      _rnnoise_process_frame(rn, outPtr, inPtr);
+      return HEAPF32.slice(outIndex, outIndex + SAMPLE);
+    }
 
     processor.onaudioprocess = (e) => {
       const input = e.inputBuffer.getChannelData(0);
       const output = e.outputBuffer.getChannelData(0);
 
-      const combined = new Float32Array(residue.length + input.length);
-      combined.set(residue);
-      combined.set(input, residue.length);
+      push(input);
 
-      let i = 0;
-      let outOffset = 0;
+      let offset = 0;
 
-      while (i + SAMPLE_LENGTH <= combined.length && outOffset + SAMPLE_LENGTH <= output.length) {
-        const frame = combined.slice(i, i + SAMPLE_LENGTH);
-        const cleaned = processFrame(frame);
+      // 🔥 ALWAYS fill output fully
+      while (offset < output.length) {
 
-        output.set(cleaned, outOffset);
+        if (queue.length >= SAMPLE) {
+          const frame = pop(SAMPLE);
+          const cleaned = processFrame(frame);
 
-        i += SAMPLE_LENGTH;
-        outOffset += SAMPLE_LENGTH;
+          output.set(cleaned, offset);
+          offset += SAMPLE;
+
+        } else {
+          // 🔥 no underrun silence = avoid crackle
+          const remaining = output.length - offset;
+          output.set(queue.slice(0, remaining), offset);
+          queue = queue.slice(remaining);
+          offset += remaining;
+        }
       }
-
-      residue = combined.slice(i);
     };
 
     window.addEventListener("beforeunload", () => {
-      free(inPtr);
-      free(outPtr);
-      destroyNoise(rn);
+      _free(inPtr);
+      _free(outPtr);
+      _rnnoise_destroy(rn);
     });
 
     source.connect(analyser);
     analyser.connect(processor);
-    processor.connect(context.destination); // 🔥 THIS enables loopback
+    processor.connect(context.destination);
 
   } else {
     source.connect(analyser);
@@ -102,15 +116,14 @@ async function analyse(stream, hasDetector = false) {
     ctx.beginPath();
     ctx.strokeStyle = "#000";
 
-    const slice = 400 / bufferLen;
+    const step = 400 / bufferLen;
     ctx.moveTo(0, 200);
 
     for (let i = 0; i < bufferLen; i++) {
       const y = 200 - (dataArray[i] / 255) * 180;
-      ctx.lineTo(i * slice, y);
+      ctx.lineTo(i * step, y);
     }
 
-    ctx.lineTo(400, 200);
     ctx.stroke();
   };
 
@@ -125,8 +138,7 @@ function setupCanvas(elem) {
   return ctx;
 }
 
-const canvas = $("#sound");
-const ctx = setupCanvas(canvas);
+const ctx = setupCanvas($("#sound"));
 
 (async () => {
   const stream = await getAudioStream();
