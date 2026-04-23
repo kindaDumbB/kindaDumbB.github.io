@@ -1,149 +1,53 @@
-<canvas id="sound"></canvas>
-<button id="toggle">Toggle Mic</button>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Fixed Mic Pipeline</title>
+</head>
 
-<script type="module">
-import rnnoise from './rnnoise.js';
+<body style="background:#111;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column">
 
-const $ = document.querySelector.bind(document);
+<button id="start">Start Mic</button>
+<div id="status">Idle</div>
 
-const canvas = $("#sound");
-const ctx = canvas.getContext("2d");
+<script>
+let ctx;
 
-canvas.width = 400;
-canvas.height = 200;
+document.getElementById("start").onclick = async () => {
+  const status = document.getElementById("status");
 
-let audioCtx;
-let analyser;
-let processor;
-let gainNode;
-let source;
+  try {
+    status.textContent = "Creating audio context...";
 
-let running = false;
+    ctx = new AudioContext({ sampleRate: 48000 });
 
-// RNNoise state
-let rn, HEAPF32;
-let inPtr, outPtr;
-let inIndex, outIndex;
+    await ctx.resume(); // 🔥 CRITICAL FIX
 
-const FRAME = 480;
-let buffer = new Float32Array(0);
+    status.textContent = "Requesting mic...";
 
-function draw() {
-  if (!analyser) {
-    requestAnimationFrame(draw);
-    return;
-  }
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true
+    });
 
-  const data = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteFrequencyData(data);
+    const source = ctx.createMediaStreamSource(stream);
 
-  ctx.fillStyle = "#fff";
-  ctx.fillRect(0, 0, 400, 200);
+    // Simple guaranteed working output first (NO RNNOISE YET)
+    const gain = ctx.createGain();
+    gain.gain.value = 1.0;
 
-  ctx.beginPath();
-  ctx.strokeStyle = "#000";
+    source.connect(gain);
+    gain.connect(ctx.destination);
 
-  const step = 400 / data.length;
-  ctx.moveTo(0, 200);
+    status.textContent = "MIC ACTIVE (loopback working)";
 
-  for (let i = 0; i < data.length; i++) {
-    const y = 200 - (data[i] / 255) * 180;
-    ctx.lineTo(i * step, y);
-  }
+    console.log("Audio pipeline running");
 
-  ctx.stroke();
-
-  requestAnimationFrame(draw);
-}
-
-async function initAudio() {
-  audioCtx = new AudioContext();
-
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-  analyser = audioCtx.createAnalyser();
-  source = audioCtx.createMediaStreamSource(stream);
-
-  processor = audioCtx.createScriptProcessor(1024, 1, 1);
-  gainNode = audioCtx.createGain();
-
-  const mod = await rnnoise();
-
-  ({
-    _rnnoise_create: rnnoise_create,
-    _rnnoise_process_frame: rnnoise_process_frame,
-    _malloc,
-    _free,
-    HEAPF32: mod.HEAPF32
-  } = mod);
-
-  HEAPF32 = mod.HEAPF32;
-
-  inPtr = _malloc(FRAME * 4);
-  outPtr = _malloc(FRAME * 4);
-
-  inIndex = inPtr / 4;
-  outIndex = outPtr / 4;
-
-  rn = rnnoise_create();
-
-  function process(frame) {
-    HEAPF32.set(frame, inIndex);
-    rnnoise_process_frame(rn, outPtr, inPtr);
-    return HEAPF32.slice(outIndex, outIndex + FRAME);
-  }
-
-  processor.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-    const output = e.outputBuffer.getChannelData(0);
-
-    if (!running) {
-      output.fill(0);
-      return;
-    }
-
-    const merged = new Float32Array(buffer.length + input.length);
-    merged.set(buffer);
-    merged.set(input, buffer.length);
-    buffer = merged;
-
-    let i = 0;
-
-    while (buffer.length >= FRAME && i + FRAME <= output.length) {
-      const frame = buffer.slice(0, FRAME);
-      buffer = buffer.slice(FRAME);
-
-      const cleaned = process(frame);
-      output.set(cleaned, i);
-
-      i += FRAME;
-    }
-
-    for (; i < output.length; i++) {
-      output[i] = 0;
-    }
-  };
-
-  source.connect(analyser);
-  analyser.connect(processor);
-  processor.connect(gainNode);
-  gainNode.connect(audioCtx.destination);
-
-  gainNode.gain.value = 1;
-
-  draw();
-}
-
-$("#toggle").onclick = async () => {
-  if (!audioCtx) {
-    await initAudio();
-  }
-
-  running = !running;
-
-  // 🔥 real mute control (safe)
-  if (gainNode) {
-    gainNode.gain.value = running ? 1 : 0;
+  } catch (err) {
+    console.error(err);
+    status.textContent = "ERROR: " + err.message;
   }
 };
 </script>
+
+</body>
+</html>
