@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>RNNoise WASM Mic</title>
+</head>
+
+<body style="background:#111;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column">
+
+<button id="start">Start RNNoise</button>
+<div id="status">Idle</div>
+
+<script>
+let audioCtx;
+let wasm;
+let memory;
+let denoiseFunc;
+let statePtr;
+
+const FRAME_SIZE = 480; // RNNoise requirement (10ms @ 48kHz)
+
+async function loadWasm() {
+  const response = await fetch("rnnoise.wasm");
+  const bytes = await response.arrayBuffer();
+
+  const importObject = {
+    env: {
+      memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
+      emscripten_resize_heap: () => {}
+    }
+  };
+
+  const result = await WebAssembly.instantiate(bytes, importObject);
+
+  wasm = result.instance;
+  memory = importObject.env.memory;
+
+  // Try common exported symbols (depends on build)
+  denoiseFunc = wasm.exports.rnnoise_process_frame || wasm.exports.process || wasm.exports.denoise;
+
+  if (!denoiseFunc) {
+    throw new Error("Could not find RNNoise export function. Check WASM build.");
+  }
+
+  // state init (varies by build)
+  if (wasm.exports.rnnoise_create) {
+    statePtr = wasm.exports.rnnoise_create();
+  }
+
+  console.log("WASM loaded");
+}
+
+function processFrame(input) {
+  // Allocate buffer in WASM memory
+  const ptr = wasm.exports.malloc(FRAME_SIZE * 4);
+
+  const floatView = new Float32Array(memory.buffer, ptr, FRAME_SIZE);
+
+  for (let i = 0; i < FRAME_SIZE; i++) {
+    floatView[i] = input[i] || 0;
+  }
+
+  // RNNoise call (depends on build signature)
+  if (statePtr) {
+    denoiseFunc(statePtr, ptr, ptr);
+  } else {
+    denoiseFunc(ptr, ptr);
+  }
+
+  const output = new Float32Array(FRAME_SIZE);
+  output.set(floatView);
+
+  wasm.exports.free(ptr);
+
+  return output;
+}
+
+document.getElementById("start").onclick = async () => {
+  const status = document.getElementById("status");
+
+  status.textContent = "Loading WASM...";
+  await loadWasm();
+
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: false
+    }
+  });
+
+  const source = audioCtx.createMediaStreamSource(stream);
+
+  const processor = audioCtx.createScriptProcessor(1024, 1, 1);
+
+  let buffer = [];
+
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const output = e.outputBuffer.getChannelData(0);
+
+    for (let i = 0; i < input.length; i++) {
+      buffer.push(input[i]);
+
+      if (buffer.length === FRAME_SIZE) {
+        const clean = processFrame(buffer);
+        buffer = [];
+
+        for (let j = 0; j < FRAME_SIZE; j++) {
+          output[j] = clean[j] || 0;
+        }
+      } else {
+        output[i] = input[i];
+      }
+    }
+  };
+
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+
+  status.textContent = "RNNoise active (WASM running)";
+};
+</script>
+
+</body>
+</html>
