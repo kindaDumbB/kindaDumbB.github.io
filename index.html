@@ -1,89 +1,163 @@
-<canvas id="sound"></canvas>
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Stable RNNoise Mic</title>
+</head>
 
-<script type="module">
-import rnnoise from './rnnoise.js';
+<body style="background:#111;color:white;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column">
 
-const $ = document.querySelector.bind(document);
+<button id="start">Start Mic</button>
+<div id="status">Idle</div>
 
-function getAudioStream() {
-  return navigator.mediaDevices.getUserMedia({ audio: true });
+<script>
+let ctx;
+let wasm;
+let memory;
+let state;
+let denoise;
+let ready = false;
+
+const FRAME_SIZE = 480;
+
+// -----------------------------
+// Load WASM safely
+// -----------------------------
+async function loadWasm() {
+  const res = await fetch("rnnoise.wasm");
+
+  if (!res.ok) throw new Error("WASM not found");
+
+  const bytes = await res.arrayBuffer();
+
+  const importObject = {
+    env: {
+      memory: new WebAssembly.Memory({ initial: 256, maximum: 512 }),
+      emscripten_resize_heap: () => {}
+    }
+  };
+
+  const { instance } = await WebAssembly.instantiate(bytes, importObject);
+
+  wasm = instance;
+  memory = importObject.env.memory;
+
+  // Try multiple export names (RNNoise builds differ)
+  denoise =
+    wasm.exports.rnnoise_process_frame ||
+    wasm.exports.process_frame ||
+    wasm.exports.rnnoise_process ||
+    wasm.exports._rnnoise_process_frame;
+
+  const create =
+    wasm.exports.rnnoise_create ||
+    wasm.exports.create ||
+    wasm.exports._rnnoise_create;
+
+  if (!denoise) {
+    console.warn("No RNNoise function found, using passthrough");
+    ready = false;
+    return;
+  }
+
+  if (create) {
+    state = create();
+  }
+
+  ready = true;
+  console.log("RNNoise ready");
 }
 
-async function analyse(stream) {
-  const ctx = new AudioContext();
+// -----------------------------
+// Frame-safe processing
+// -----------------------------
+function processFrame(input) {
+  if (!ready || !denoise) {
+    return input; // SAFE fallback (prevents silence/noise spikes)
+  }
 
-  const analyser = ctx.createAnalyser();
+  const ptr = wasm.exports.malloc(FRAME_SIZE * 4);
+  const buffer = new Float32Array(memory.buffer, ptr, FRAME_SIZE);
+
+  for (let i = 0; i < FRAME_SIZE; i++) {
+    buffer[i] = input[i] || 0;
+  }
+
+  // Safe call (different builds supported)
+  try {
+    if (state !== undefined) {
+      denoise(state, ptr, ptr);
+    } else {
+      denoise(ptr, ptr);
+    }
+  } catch (e) {
+    console.warn("RNNoise error, fallback active", e);
+    wasm.exports.free(ptr);
+    return input;
+  }
+
+  const output = new Float32Array(FRAME_SIZE);
+  output.set(buffer);
+
+  wasm.exports.free(ptr);
+
+  return output;
+}
+
+// -----------------------------
+// Start audio
+// -----------------------------
+document.getElementById("start").onclick = async () => {
+  const status = document.getElementById("status");
+
+  status.textContent = "Loading WASM...";
+
+  await loadWasm();
+
+  ctx = new AudioContext({ sampleRate: 48000 });
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: false
+    }
+  });
+
   const source = ctx.createMediaStreamSource(stream);
+
   const processor = ctx.createScriptProcessor(1024, 1, 1);
 
-  const {
-    _rnnoise_create,
-    _rnnoise_process_frame,
-    _rnnoise_destroy,
-    _malloc,
-    _free,
-    HEAPF32
-  } = await rnnoise();
-
-  const FRAME = 480;
-
-  const inPtr = _malloc(FRAME * 4);
-  const outPtr = _malloc(FRAME * 4);
-
-  const inIndex = inPtr / 4;
-  const outIndex = outPtr / 4;
-
-  const rn = _rnnoise_create();
-
-  // 🔥 CRITICAL: strict frame buffer (NO streaming mix)
-  let buffer = new Float32Array(0);
-
-  function process(frame) {
-    HEAPF32.set(frame, inIndex);
-    _rnnoise_process_frame(rn, outPtr, inPtr);
-    return new Float32Array(HEAPF32.slice(outIndex, outIndex + FRAME));
-  }
+  let buffer = [];
 
   processor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
     const output = e.outputBuffer.getChannelData(0);
 
-    // accumulate
-    const merged = new Float32Array(buffer.length + input.length);
-    merged.set(buffer);
-    merged.set(input, buffer.length);
-    buffer = merged;
+    for (let i = 0; i < input.length; i++) {
+      buffer.push(input[i]);
 
-    let outOffset = 0;
+      if (buffer.length === FRAME_SIZE) {
+        const clean = processFrame(buffer);
+        buffer = [];
 
-    // 🔥 ONLY full frames
-    while (buffer.length >= FRAME && outOffset + FRAME <= output.length) {
-      const frame = buffer.slice(0, FRAME);
-      buffer = buffer.slice(FRAME);
-
-      const cleaned = process(frame);
-      output.set(cleaned, outOffset);
-
-      outOffset += FRAME;
-    }
-
-    // 🔥 fill remainder to avoid crackle/silence gaps
-    for (; outOffset < output.length; outOffset++) {
-      output[outOffset] = 0;
+        for (let j = 0; j < FRAME_SIZE; j++) {
+          output[j] = clean[j] || 0;
+        }
+      } else {
+        output[i] = input[i]; // ALWAYS pass-through
+      }
     }
   };
 
-  source.connect(analyser);
-  analyser.connect(processor);
-  processor.connect(ctx.destination); // loopback
+  source.connect(processor);
+  processor.connect(ctx.destination);
 
-  return (ctx2) => {
-    analyser.getByteFrequencyData(new Uint8Array(analyser.frequencyBinCount));
-  };
-}
-
-(async () => {
-  const stream = await getAudioStream();
-  await analyse(stream);
-})();
+  status.textContent = ready
+    ? "RNNoise ACTIVE"
+    : "Fallback mode (no RNNoise export found)";
+};
 </script>
+
+</body>
+</html>
