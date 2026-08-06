@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>A Warning to Parents: Parental Controls Don't Work | Timber</title>
@@ -268,7 +269,89 @@ Nationwide Children's Hospital – Sleep in Adolescents
 It's a hard balance to maintain not spoiling your kid while also not misusing/overusing parental controls. The purpose of this is to spread awareness that parental controls are not a fix-all solution.
 </p>
 <h2>Quote From Research</h2>
+<h2>Recommended Screen Time (If You Want a Set Limit)</h2>
 
+<p>
+This graph represents a suggested maximum screen time limit by age. It is not
+a strict rule, but a guideline for parents who prefer having a structured limit.
+</p>
+
+<canvas id="screenTimeChart"></canvas>
+
+<div class="note">
+<strong>Disclaimer:</strong><br><br>
+
+(AI enhanced text below. Edited to reflect better what I mean)
+<br>
+The recommended way to handle restrictions is not to immediately restrict screen
+time. Allow your child to develop responsibility with electronics. If electronics
+begin negatively affecting school, sleep, responsibilities, or personal growth,
+start with a soft limit that gives them the opportunity to improve.
+<br><br>
+Only as a final resort should strict restrictions be considered, such as a weekly
+screen time limit of around <strong>5-15 hours per day</strong>. The goal should
+be teaching responsibility, not controlling the child.
+</div>
+
+<script>
+const ctx = document.getElementById('screenTimeChart');
+
+new Chart(ctx, {
+    type: 'line',
+    data: {
+        labels: [
+            "11",
+            "13",
+            "15",
+            "17"
+        ],
+        datasets: [{
+            label: "Recommended Hours Per Day",
+            data: [
+                5,
+                6,
+                9,
+                13,
+            ],
+            tension: 0.45,
+            fill: false,
+            borderWidth: 3,
+            pointRadius: 6
+        }]
+    },
+    options: {
+        responsive:true,
+
+        plugins:{
+            legend:{
+                display:true
+            },
+
+            title:{
+                display:true,
+                text:"Screen Time Recommendation Curve"
+            }
+        },
+
+        scales:{
+            x:{
+                title:{
+                    display:true,
+                    text:"Age"
+                }
+            },
+
+            y:{
+                beginAtZero:true,
+                title:{
+                    display:true,
+                    text:"Hours Per Week"
+                }
+            }
+        }
+    }
+});
+</script>
 <blockquote>
 "This is my daughter. She is 16, and we do not limit her screen time use as long
 as she keeps it reasonable. We have specific rules—get up in time for school and
