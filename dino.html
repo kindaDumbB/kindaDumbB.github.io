@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dark Dino Runner</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #111821;
+    --text: #e8eef5;
+    --muted: #8b98a8;
+    --accent: #6ee7b7;
+    --danger: #fb7185;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background: radial-gradient(circle at top, #17202b, var(--bg) 65%);
+    color: var(--text);
+    font-family: system-ui, sans-serif;
+    overflow: hidden;
+  }
+  .game-wrap {
+    width: min(950px, 94vw);
+    padding: 20px;
+    background: rgba(17, 24, 33, .92);
+    border: 1px solid #263241;
+    border-radius: 18px;
+    box-shadow: 0 20px 70px rgba(0,0,0,.45);
+  }
+  .top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  h1 { margin: 0; font-size: 1.25rem; }
+  .score { font-variant-numeric: tabular-nums; color: var(--accent); }
+  canvas {
+    width: 100%;
+    height: auto;
+    display: block;
+    background: #0d131a;
+    border: 1px solid #273443;
+    border-radius: 12px;
+    image-rendering: pixelated;
+    cursor: pointer;
+  }
+  .help {
+    text-align: center;
+    color: var(--muted);
+    font-size: .9rem;
+    margin-top: 12px;
+  }
+  kbd {
+    padding: 2px 7px;
+    border: 1px solid #3a4655;
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    background: #151d27;
+    color: var(--text);
+  }
+</style>
+</head>
+<body>
+<div class="game-wrap">
+  <div class="top">
+    <h1>🦖 Dark Dino Runner</h1>
+    <div class="score">Score: <span id="score">00000</span> · Best: <span id="best">00000</span></div>
+  </div>
+  <canvas id="game" width="900" height="300"></canvas>
+  <div class="help">
+    <kbd>Space</kbd> / <kbd>↑</kbd> Jump &nbsp; • &nbsp; <kbd>R</kbd> Restart &nbsp; • &nbsp; Click/tap to jump
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const scoreEl = document.getElementById("score");
+const bestEl = document.getElementById("best");
+
+let best = Number(localStorage.getItem("darkDinoBest") || 0);
+bestEl.textContent = String(best).padStart(5, "0");
+
+const groundY = 245;
+const dino = {
+  x: 90, y: groundY - 48, w: 42, h: 48,
+  vy: 0, gravity: 1700, jump: -650, grounded: true
+};
+
+let obstacles = [];
+let particles = [];
+let clouds = [];
+let score = 0;
+let speed = 360;
+let spawnTimer = 0;
+let gameOver = false;
+let started = false;
+let last = performance.now();
+
+for (let i = 0; i < 7; i++) {
+  clouds.push({
+    x: Math.random() * canvas.width,
+    y: 35 + Math.random() * 75,
+    w: 40 + Math.random() * 55,
+    speed: 12 + Math.random() * 15
+  });
+}
+
+function reset() {
+  dino.y = groundY - dino.h;
+  dino.vy = 0;
+  dino.grounded = true;
+  obstacles = [];
+  particles = [];
+  score = 0;
+  speed = 360;
+  spawnTimer = .7;
+  gameOver = false;
+  started = true;
+}
+
+function jump() {
+  if (gameOver) {
+    reset();
+    return;
+  }
+  if (!started) reset();
+  if (dino.grounded) {
+    dino.vy = dino.jump;
+    dino.grounded = false;
+  }
+}
+
+function addObstacle() {
+  const tall = Math.random() < .35;
+  const w = tall ? 24 : 18 + Math.random() * 18;
+  const h = tall ? 52 + Math.random() * 22 : 30 + Math.random() * 25;
+  obstacles.push({ x: canvas.width + 20, y: groundY - h, w, h });
+}
+
+function burst(x, y) {
+  for (let i = 0; i < 14; i++) {
+    particles.push({
+      x, y,
+      vx: -80 + Math.random() * 160,
+      vy: -120 - Math.random() * 100,
+      life: .45 + Math.random() * .35
+    });
+  }
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x &&
+         a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function update(dt) {
+  if (!started || gameOver) return;
+
+  score += dt * 10;
+  speed = Math.min(650, 360 + score * 1.8);
+
+  dino.vy += dino.gravity * dt;
+  dino.y += dino.vy * dt;
+
+  if (dino.y >= groundY - dino.h) {
+    dino.y = groundY - dino.h;
+    dino.vy = 0;
+    dino.grounded = true;
+  }
+
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    addObstacle();
+    spawnTimer = Math.max(.65, 1.25 - score / 900) + Math.random() * .75;
+  }
+
+  for (const o of obstacles) o.x -= speed * dt;
+  obstacles = obstacles.filter(o => o.x + o.w > -20);
+
+  for (const c of clouds) {
+    c.x -= c.speed * dt;
+    if (c.x + c.w < 0) c.x = canvas.width + Math.random() * 100;
+  }
+
+  const hitbox = {x: dino.x + 7, y: dino.y + 5, w: dino.w - 12, h: dino.h - 7};
+  for (const o of obstacles) {
+    if (rectsOverlap(hitbox, o)) {
+      gameOver = true;
+      best = Math.max(best, Math.floor(score));
+      localStorage.setItem("darkDinoBest", best);
+      bestEl.textContent = String(best).padStart(5, "0");
+      burst(dino.x + dino.w / 2, dino.y + dino.h / 2);
+      break;
+    }
+  }
+
+  for (const p of particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 400 * dt;
+    p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+
+  scoreEl.textContent = String(Math.floor(score)).padStart(5, "0");
+}
+
+function drawDino() {
+  ctx.fillStyle = "#6ee7b7";
+  ctx.fillRect(dino.x + 10, dino.y + 13, 25, 27);
+  ctx.fillRect(dino.x + 25, dino.y + 3, 16, 20);
+  ctx.fillRect(dino.x + 34, dino.y, 9, 10);
+  ctx.fillRect(dino.x + 3, dino.y + 22, 11, 10);
+
+  ctx.fillStyle = "#0b0f14";
+  ctx.fillRect(dino.x + 34, dino.y + 7, 4, 4);
+
+  ctx.fillStyle = "#6ee7b7";
+  const step = Math.floor(performance.now() / 100) % 2;
+  ctx.fillRect(dino.x + 13, dino.y + 38, 7, 10);
+  ctx.fillRect(dino.x + 27, dino.y + 38, 7, step ? 7 : 10);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Background stars
+  ctx.fillStyle = "#1d2936";
+  for (let i = 0; i < 45; i++) {
+    const x = (i * 83) % canvas.width;
+    const y = (i * 47) % 180;
+    ctx.fillRect(x, y, 2, 2);
+  }
+
+  // Moon
+  ctx.fillStyle = "#dbe7f2";
+  ctx.beginPath();
+  ctx.arc(760, 65, 28, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#0d131a";
+  ctx.beginPath();
+  ctx.arc(772, 57, 28, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Clouds
+  ctx.fillStyle = "#18222d";
+  for (const c of clouds) {
+    ctx.fillRect(c.x, c.y, c.w, 8);
+    ctx.fillRect(c.x + 10, c.y - 7, c.w * .45, 15);
+  }
+
+  // Ground
+  ctx.fillStyle = "#2b3744";
+  ctx.fillRect(0, groundY, canvas.width, 3);
+  ctx.fillStyle = "#1b2631";
+  for (let x = -((performance.now() / 8) % 40); x < canvas.width; x += 40) {
+    ctx.fillRect(x, groundY + 12, 22, 3);
+  }
+
+  // Obstacles
+  ctx.fillStyle = "#fb7185";
+  for (const o of obstacles) {
+    ctx.fillRect(o.x + 6, o.y, o.w - 6, o.h);
+    ctx.fillRect(o.x, o.y + 12, 8, 12);
+    if (o.h > 50) ctx.fillRect(o.x + o.w - 2, o.y + 18, 8, 12);
+  }
+
+  drawDino();
+
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life * 2);
+    ctx.fillStyle = "#6ee7b7";
+    ctx.fillRect(p.x, p.y, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+
+  if (!started) {
+    overlay("DINO RUNNER", "Press SPACE or tap to start");
+  } else if (gameOver) {
+    overlay("GAME OVER", "Press SPACE, R, or tap to restart");
+  }
+}
+
+function overlay(title, subtitle) {
+  ctx.fillStyle = "rgba(5, 8, 12, .68)";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#e8eef5";
+  ctx.font = "bold 32px system-ui";
+  ctx.fillText(title, canvas.width / 2, 125);
+  ctx.fillStyle = "#8b98a8";
+  ctx.font = "18px system-ui";
+  ctx.fillText(subtitle, canvas.width / 2, 160);
+  ctx.textAlign = "left";
+}
+
+function loop(now) {
+  const dt = Math.min(.033, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+addEventListener("keydown", e => {
+  if (["Space", "ArrowUp"].includes(e.code)) {
+    e.preventDefault();
+    jump();
+  }
+  if (e.code === "KeyR") reset();
+});
+
+canvas.addEventListener("pointerdown", jump);
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
